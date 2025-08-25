@@ -46,7 +46,6 @@ extern "C" {
 #include <sys/uio.h>
 
 static char configuration[] =
-"pid /tmp/nginx.pid;\n"
 "events {\n"
 "    worker_connections 4;\n"
 "    multi_accept off;\n"
@@ -210,10 +209,12 @@ extern "C" int InitializeNginx(void)
   }
 
 
+  /*
   if (ngx_create_pidfile(&ccf->pid, cycle->log) != NGX_OK) {
     fprintf(stdout, "[ERROR] !!Failed to ngx_create_pidfile\n");
     exit(-1);
   }
+  */
   
   if (ngx_log_redirect_stderr(cycle) != NGX_OK) {
     fprintf(stdout, "[ERROR] !!Failed to ngx_log_redirect_stderr\n");
@@ -424,14 +425,6 @@ int __wrap_bind(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
   http_listen_fd = sockfd;
 
   return 0;
-}
-
-extern "C"
-int __wrap_open(const char *pathname, int flags, mode_t mode)
-{
-  int fd = syscall(SYS_open, pathname, flags, mode);
-
-  return fd;
 }
 
 extern "C"

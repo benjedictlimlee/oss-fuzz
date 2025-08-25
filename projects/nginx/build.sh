@@ -14,40 +14,30 @@
 # limitations under the License.
 #
 ################################################################################
-hg import $SRC/add_fuzzers.diff --no-commit
+git apply $SRC/add_fuzzers.diff
 
 cp -r $SRC/fuzz src/
 cp $SRC/make_fuzzers auto/make_fuzzers
 
 cd src/fuzz
-#rm -rf genfiles && mkdir genfiles && $SRC/LPM/external.protobuf/bin/protoc http_request_proto.proto --cpp_out=genfiles
+rm -rf genfiles && mkdir genfiles && $SRC/LPM/external.protobuf/bin/protoc http_request_proto.proto --cpp_out=genfiles
 cd ../..
 
 auto/configure \
-    --with-ld-opt="-Wl,--wrap=listen -Wl,--wrap=setsockopt -Wl,--wrap=bind -Wl,--wrap=shutdown -Wl,--wrap=connect -Wl,--wrap=getpwnam -Wl,--wrap=getgrnam -Wl,--wrap=chmod -Wl,--wrap=chown -Wl,--wrap=writev, -Wl,--wrap=open, -Wl,--wrap=getsockopt, -Wl,--wrap=select, -Wl,--wrap=recv, -Wl,--wrap=read, -Wl,--wrap=send, -Wl,--wrap=epoll_create, -Wl,--wrap=epoll_create1, -Wl,--wrap=epoll_wait, -Wl,--wrap=epoll_ctl, -Wl,--wrap=close, -Wl,--wrap=ioctl, -Wl,--wrap=listen, -Wl,--wrap=accept, -Wl,--wrap=accept4, -Wl,--wrap=setsockopt, -Wl,--wrap=bind, -Wl,--wrap=shutdown, -Wl,--wrap=connect, -Wl,--wrap=getpwnam, -Wl,--wrap=getgrnam, -Wl,--wrap=chmod, -Wl,--wrap=chown" \
+    --with-ld-opt="-Wl,--wrap=writev -Wl,--wrap=getsockopt -Wl,--wrap=select -Wl,--wrap=recv -Wl,--wrap=read -Wl,--wrap=send -Wl,--wrap=epoll_create -Wl,--wrap=epoll_create1 -Wl,--wrap=epoll_wait -Wl,--wrap=epoll_ctl -Wl,--wrap=close -Wl,--wrap=ioctl -Wl,--wrap=listen -Wl,--wrap=accept -Wl,--wrap=accept4 -Wl,--wrap=setsockopt -Wl,--wrap=bind -Wl,--wrap=shutdown -Wl,--wrap=connect -Wl,--wrap=getpwnam -Wl,--wrap=getgrnam -Wl,--wrap=chmod -Wl,--wrap=chown" \
     --with-cc-opt='-DNGX_DEBUG_PALLOC=1' \
     --with-http_v2_module \
-    --with-mail \
-    --with-http_ssl_module \
-    --with-http_realip_module \
-    --with-http_addition_module \
-    --with-http_sub_module \
-    --with-http_dav_module \
-    --with-http_flv_module \
-    --with-http_mp4_module \
-    --with-http_gunzip_module \
-    --with-http_gzip_static_module \
-    --with-http_auth_request_module \
-    --with-http_random_index_module \
-    --with-http_secure_link_module \
-    --with-http_degradation_module \
-    --with-http_stub_status_module \
-    --with-http_slice_module \
-    --with-stream \
-    --with-pcre \
-    --with-debug 
-
+    --with-mail
 make -f objs/Makefile fuzzers
 
-cp objs/*_fuzzer $OUT/
+cp objs/*_harness objs/*_fuzzer $OUT/
 cp $SRC/fuzz/*.dict $OUT/
+mkdir ${OUT}/html
+cp ${SRC}/nginx/docs/html/index.html ${OUT}/html/index.html
+
+for harness in "http_request_fuzzer" "mail_request_harness" "smtp_harness"; do
+    echo "[asan]" > ${OUT}/$harness.options
+    echo "detect_leaks=0" >> ${OUT}/$harness.options
+done
+
+mkdir ${OUT}/logs/

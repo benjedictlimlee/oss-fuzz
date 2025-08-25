@@ -18,35 +18,41 @@ extern "C" {
 #include <ngx_core.h>
 #include <ngx_event.h>
 #include <ngx_http.h>
+#include <sys/sendfile.h>
 }
+#include <cassert>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
+#include <sys/uio.h>
 
 #include "http_request_proto.pb.h"
 #include "libprotobuf-mutator/src/libfuzzer/libfuzzer_macro.h"
 
 static char configuration[] =
 "error_log stderr emerg;\n"
+"trace on;\n"
 "worker_rlimit_nofile 8192;\n"
+"pid logs/nginx.pid;\n"
+"remote_admin off;\n"
 "events {\n"
-"    use epoll;\n"
 "    worker_connections 2;\n"
 "    multi_accept off;\n"
 "    accept_mutex off;\n"
 "}\n"
 "http {\n"
 "    server_tokens off;\n"
+"    sendfile        on;\n"
 "    default_type application/octet-stream;\n"
 "    map $http_upgrade $connection_upgrade {\n"
 "      default upgrade;\n"
 "      '' close;\n"
 "    }\n"
 "    error_log stderr emerg;\n"
-"    access_log off;\n"
+"    access_log stderr;\n"
 "    map $subdomain $nss {\n"
 "      default local_upstream;\n"
 "    }\n"
@@ -62,6 +68,14 @@ static char configuration[] =
 "      server 127.0.0.1:1018 max_fails=0;\n"
 "      server 127.0.0.1:1019 max_fails=0;\n"
 "    }\n"
+"    map $http_user_agent $is_modern_browser {\n"
+"        default         0;\n"
+"        \"~*Firefox\"     1;\n"
+"        \"~*Chrome\"      1;\n"
+"        \"~*Safari\"      1;\n"
+"        \"~*Opera\"       1;\n"
+"        \"~*Edge\"        1;\n"
+"    }\n"
 "    client_max_body_size 256M;\n"
 "    client_body_temp_path /tmp/;\n"
 "    proxy_temp_path /tmp/;\n"
@@ -71,7 +85,7 @@ static char configuration[] =
 "    proxy_busy_buffers_size 28K;\n"
 "    proxy_buffering off;\n"
 "    server {\n"
-"      listen unix:nginx.sock;\n"
+"      listen 80;\n"
 "      server_name ~^(?<subdomain>.+)\\.url.com$;\n"
 "      proxy_next_upstream off;\n"
 "      proxy_read_timeout 5m;\n"
@@ -80,6 +94,28 @@ static char configuration[] =
 "      proxy_set_header X-Real-IP $remote_addr;\n"
 "      proxy_set_header X-Real-Port $remote_port;\n"
 "      location / {\n"
+"          root   /out/html;\n"
+"          index  index.html;\n"
+"          userid          on;\n"
+"          userid_name     uid;\n"
+"          userid_path     /;\n"
+"          userid_expires  365d;\n"
+"          userid_service  1;\n"
+"          if ($is_modern_browser) {\n"
+"              # Special configuration for modern browsers\n"
+"              add_header Set-Cookie \"cookie=$http_cookie;host=$host\";\n"
+"          }\n"
+"      }\n"
+"      location /old {\n"
+"          rewrite ^/old/(.*)$ /new/$1 last;\n"
+"      }\n"
+"      location /lastConnection {\n"
+"          return 200 \"Last IP: $last_ip\";\n"
+"      }\n"
+"      location /host_specs {\n"
+"          return 200 \"Host Specifications:\\n$host_specs\";\n"
+"      }\n"
+"      location /prox/ {\n"
 "        proxy_pass http://$nss;\n"
 "        proxy_set_header Host $http_host;\n"
 "        proxy_set_header X-Real-IP $remote_addr;\n"
@@ -89,10 +125,12 @@ static char configuration[] =
 "        proxy_buffering off;\n"
 "        proxy_cache off;\n"
 "      }\n"
-"    }\n"
+"        location = /empty {\n"
+"            empty_gif;\n"
+"        }\n"
+"      }\n"
 "}\n"
 "\n";
-
 
 static ngx_cycle_t *cycle;
 static ngx_log_t ngx_log;
@@ -104,87 +142,14 @@ extern char **environ;
 
 static const char *config_file = "/tmp/http_config.conf";
 
-struct fuzzing_data {
-  const uint8_t *data;
-  size_t data_len;
-};
-
-static struct fuzzing_data request;
-static struct fuzzing_data reply;
-
-static ngx_http_upstream_t *upstream;
-static ngx_http_request_t *req_reply;
-static ngx_http_cleanup_t cln_new = {};
-static int cln_added;
-
-// Called when finalizing the request to upstream
-// Do not need to clean the request pool
-static void cleanup_reply(void *data) { req_reply = NULL; }
-
-// Called by the http parser to read the buffer
-static ssize_t request_recv_handler(ngx_connection_t *c, u_char *buf,
-                                    size_t size) {
-  if (request.data_len < size)
-    size = request.data_len;
-  memcpy(buf, request.data, size);
-  request.data += size;
-  request.data_len -= size;
-  return size;
-}
-
-// Feed fuzzing input for the reply from upstream
-static ssize_t reply_recv_handler(ngx_connection_t *c, u_char *buf,
-                                  size_t size) {
-  req_reply = (ngx_http_request_t *)(c->data);
-  if (!cln_added) { // add cleanup so that we know whether everything is cleanup
-                    // correctly
-    cln_added = 1;
-    cln_new.handler = cleanup_reply;
-    cln_new.next = req_reply->cleanup;
-    cln_new.data = NULL;
-    req_reply->cleanup = &cln_new;
-  }
-  upstream = req_reply->upstream;
-
-  if (reply.data_len < size)
-    size = reply.data_len;
-  memcpy(buf, reply.data, size);
-  reply.data += size;
-  reply.data_len -= size;
-  if (size == 0)
-    c->read->ready = 0;
-  return size;
-}
-
-static ngx_int_t add_event(ngx_event_t *ev, ngx_int_t event, ngx_uint_t flags) {
-  return NGX_OK;
-}
-
-static ngx_int_t init_event(ngx_cycle_t *cycle, ngx_msec_t timer) {
-  return NGX_OK;
-}
-
-// Used when sending data, do nothing
-static ngx_chain_t *send_chain(ngx_connection_t *c, ngx_chain_t *in,
-                               off_t limit) {
-  c->read->ready = 1;
-  c->recv = reply_recv_handler;
-  return in->next;
-}
-
 // Create a base state for Nginx without starting the server
-extern "C" int InitializeNginx(void) {
+extern "C" int InitializeNginx(void)
+{
   ngx_log_t *log;
   ngx_cycle_t init_cycle;
-
-  if (access("nginx.sock", F_OK) != -1) {
-    remove("nginx.sock");
-  }
+  ngx_core_conf_t  *ccf;
 
   ngx_debug_init();
-  ngx_strerror_init();
-  ngx_time_init();
-  ngx_regex_init();
 
   // Just output logs to stderr
   ngx_log.file = &ngx_log_file;
@@ -204,16 +169,32 @@ extern "C" int InitializeNginx(void) {
   ngx_argv = ngx_os_argv = my_argv;
   ngx_argc = 0;
 
+  if (ngx_strerror_init() != NGX_OK) {
+    fprintf(stdout, "[ERROR] !!Failed to ngx_strerror_init\n");
+    exit(-1);
+  }
+
+  ngx_time_init();
+
+  ngx_regex_init();
+  
   // Weird trick to free a leaking buffer always caught by ASAN
   // We basically let ngx overwrite the environment variable, free the leak and
   // restore the environment as before.
   char *env_before = environ[0];
   environ[0] = my_argv[0] + 1;
-  ngx_os_init(log);
+
+  if (ngx_os_init(log) != NGX_OK) {
+    return 1;
+  }
+
   free(environ[0]);
   environ[0] = env_before;
 
   ngx_crc32_table_init();
+
+  ngx_slab_sizes_init();
+
   ngx_preinit_modules();
 
   FILE *fptr = fopen(config_file, "w");
@@ -224,108 +205,396 @@ extern "C" int InitializeNginx(void) {
 
   cycle = ngx_init_cycle(&init_cycle);
 
+  if ( cycle == NULL ) {
+    fprintf(stdout, "[ERROR] init cycle failed probably bad config\n");
+    exit(-1);
+  }
   ngx_os_status(cycle->log);
+
   ngx_cycle = cycle;
 
-  ngx_event_actions.add = add_event;
-  ngx_event_actions.init = init_event;
-  ngx_io.send_chain = send_chain;
+  ccf = (ngx_core_conf_t *) ngx_get_conf(cycle->conf_ctx, ngx_core_module);
+  
+  if (ccf->master && ngx_process == NGX_PROCESS_SINGLE) {
+    ngx_process = NGX_PROCESS_MASTER;
+  }
+
+
+  /*
+  if (ngx_create_pidfile(&ccf->pid, cycle->log) != NGX_OK) {
+    fprintf(stdout, "[ERROR] !!Failed to ngx_create_pidfile\n");
+    exit(-1);
+  }
+  */
+  
+  if (ngx_log_redirect_stderr(cycle) != NGX_OK) {
+    fprintf(stdout, "[ERROR] !!Failed to ngx_log_redirect_stderr\n");
+    exit(-1);
+  }
+
   ngx_event_flags = 1;
   ngx_queue_init(&ngx_posted_accept_events);
   ngx_queue_init(&ngx_posted_next_events);
   ngx_queue_init(&ngx_posted_events);
   ngx_event_timer_init(cycle->log);
+
+  for (int i = 0; cycle->modules[i]; i++) {
+    if (cycle->modules[i]->init_process) {
+      if (cycle->modules[i]->init_process(cycle) == NGX_ERROR) {
+        //fatal
+        exit(2);
+      }
+    }
+  }
+
   return 0;
 }
 
-extern "C" long int invalid_call(ngx_connection_s *a, ngx_chain_s *b,
-                                 long int c) {
+int http_listen_fd = -1;
+int http_client_fd = -1;
+
+int pipefd[2];
+
+// Opens a pipe, dupes that over the opened client socket and writes the fuzz data there
+int setup_pipe_data(const uint8_t *data, size_t size)
+{
+  ssize_t numBytes;
+  int flags;
+
+  // If the client isn't connected then that is bad
+  if (http_client_fd == -1) {
+    exit(-1);
+  }
+
+  if (pipe(pipefd) == -1) {
+    perror("pipe");
+    exit(-1);
+  }
+
+  // Write the data then close the write end of the pipe
+  numBytes = write(pipefd[1], data, size);
+  if (numBytes == -1) {
+    perror("write");
+    exit(-1);
+  }
+
+  // Set the read end of the pipe to non-blocking
+    flags = fcntl(pipefd[0], F_GETFL, 0);
+    if (flags == -1) {
+        perror("fcntl F_GETFL");
+        exit(-1);
+    }
+
+    if (fcntl(pipefd[0], F_SETFL, flags | O_NONBLOCK) == -1) {
+        perror("fcntl F_SETFL");
+        exit(-1);
+    }
+
+  // Dup the read end of the pipe over the client fd
+  if (dup2(pipefd[0], http_client_fd) == -1) {
+        perror("dup2");
+        exit(-1);
+    }
+
   return 0;
+
 }
 
 DEFINE_PROTO_FUZZER(const HttpProto &input) {
   static int init = InitializeNginx();
   assert(init == 0);
+  //data = (const uint8_t *)"GET / HTTP/1.1\r\nHost: localhost\r\nAccept: */*\r\n\r\n";
+  //size = strlen((const char *)data);
 
-  // have two free connections, one for client, one for upstream
-  ngx_event_t read_event1 = {};
-  ngx_event_t write_event1 = {};
-  ngx_connection_t local1 = {};
-  ngx_event_t read_event2 = {};
-  ngx_event_t write_event2 = {};
-  ngx_connection_t local2 = {};
-  ngx_connection_t *c;
-  ngx_listening_t *ls;
+  // This being here triggers a call to accept. The wrappers will handle the call
+  //  and create the first socket.
+  ngx_process_events_and_timers((ngx_cycle_t *)ngx_cycle);
 
-  req_reply = NULL;
-  upstream = NULL;
-  cln_added = 0;
-
-  const char *req_string = input.request().c_str();
+  const uint8_t *req_string = (const uint8_t *) input.request().c_str();
   size_t req_len = input.request().size();
-  const char *rep_string = input.reply().c_str();
-  size_t rep_len = input.reply().size();
-  request.data = (const uint8_t *)req_string;
-  request.data_len = req_len;
-  reply.data = (const uint8_t *)rep_string;
-  reply.data_len = rep_len;
 
-  // Use listening entry created from configuration
-  ls = (ngx_listening_t *)ngx_cycle->listening.elts;
+  // Create the pipe that will allow nginx to read the data as if it were a socket.
+  setup_pipe_data( req_string, req_len);
 
-  // Fake event ready for dispatch on read
-  local1.read = &read_event1;
-  local1.write = &write_event1;
-  local2.read = &read_event2;
-  local2.write = &write_event2;
-  local2.send_chain = send_chain;
-
-  // Create fake free connection to feed the http handler
-  ngx_cycle->free_connections = &local1;
-  local1.data = &local2;
-  ngx_cycle->free_connection_n = 2;
-
-  // Initialize connection
-  c = ngx_get_connection(
-      255, &ngx_log); // 255 - (hopefully unused) socket descriptor
-
-  c->shared = 1;
-  c->destroyed = 0;
-  c->type = SOCK_STREAM;
-  c->pool = ngx_create_pool(256, ngx_cycle->log);
-  c->sockaddr = ls->sockaddr;
-  c->listening = ls;
-  c->recv = request_recv_handler; // Where the input will be read
-  c->send_chain = send_chain;
-  c->send = (ngx_send_pt)invalid_call;
-  c->recv_chain = (ngx_recv_chain_pt)invalid_call;
-  c->log = &ngx_log;
-  c->pool->log = &ngx_log;
-  c->read->log = &ngx_log;
-  c->write->log = &ngx_log;
-  c->socklen = ls->socklen;
-  c->local_sockaddr = ls->sockaddr;
-  c->local_socklen = ls->socklen;
-  c->data = NULL;
-
-  read_event1.ready = 1;
-  write_event1.ready = write_event1.delayed = 1;
-
-  // Will redirect to http parser
-  ngx_http_init_connection(c);
-
-  // We do not provide working timers or events, and thus we have to manually
-  // clean up the requests we created. We do this here.
-  // Cross-referencing: https://trac.nginx.org/nginx/ticket/2080#no1).I
-  // This is a fix that should be bettered in the future, by creating proper
-  // timers and events.
-  if (c->destroyed != 1) {
-    if (c->read->data != NULL) {
-      ngx_connection_t *c2 = (ngx_connection_t*)c->read->data;
-        ngx_http_request_t *req_tmp = (ngx_http_request_t*)c2->data;
-        req_tmp->cleanup = NULL;
-        ngx_http_finalize_request(req_tmp, NGX_DONE);
-    }
-    ngx_close_connection(c);
+  // The accept takes a connection, which drops the free connection count to 2. There
+  //    could also be a connection to the http auth server which takes up a connection
+  //    as well as a connection to the mail proxy. The auth server connection will likely
+  //    be disconnected prior to the proxy. Once all these connections are done it means
+  //    that there is no additional data in the pipe previously set up so it is time to bail.
+  while (ngx_cycle->free_connection_n != 1) {
+    ngx_process_events_and_timers((ngx_cycle_t *)ngx_cycle);
   }
+
+  // Clean up the pipes
+  close(pipefd[0]);
+  close(pipefd[1]);
+
+  // Make sure that all of the global state variables are reset.
+  http_client_fd = -1;
+}
+
+/*************
+ * The code below here are wrappers that mimic the network traffic expected
+ * of a mail proxy. They will be specific to each fuzzer and so must be
+ * included in the fuzzer itself. Initially, when there was just the single
+ * http fuzzer these were separate but with additional fuzzers comes the
+ * need for individualized wrappers.
+ * ************/
+
+#include <sys/socket.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <grp.h>
+#include <pwd.h>
+#include <sys/epoll.h>
+
+// Because the __real_<symbol> doesn't get resolved at compile time we need to help out a bit
+extern "C" typeof (recv) __real_recv;
+extern "C" typeof (open) __real_open;
+extern "C" typeof (close) __real_close;
+extern "C" typeof (send) __real_send;
+extern "C" typeof (select) __real_select;
+extern "C" typeof (read) __real_read;
+extern "C" typeof (epoll_create) __real_epoll_create;
+extern "C" typeof (epoll_create1) __real_epoll_create1;
+extern "C" typeof (epoll_ctl) __real_epoll_ctl;
+extern "C" typeof (epoll_wait) __real_epoll_wait;
+extern "C" typeof (accept) __real_accept;
+extern "C" typeof (accept4) __real_accept4;
+extern "C" typeof (getsockopt) __real_getsockopt;
+extern "C" typeof (ioctl) __real_ioctl;
+extern "C" typeof (writev) __real_writev;
+
+extern "C"
+ssize_t __wrap_writev(int fd, const struct iovec *iov, int iovcnt)
+{
+  size_t totalBytes = 0;
+  
+  for (int i = 0; i < iovcnt; ++i) {
+    totalBytes += iov[i].iov_len;
+  }
+  
+  return totalBytes;
+}
+
+extern "C"
+int __wrap_ioctl(int fd, unsigned long request, ...) {
+  return 0;
+}
+
+extern "C"
+int __wrap_connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
+  return 0;
+}
+
+extern "C"
+ssize_t __wrap_recv(int sockfd, void *buf, size_t len, int flags)
+{
+  ssize_t count;
+  ssize_t res;
+  char c;
+
+  if (sockfd == http_client_fd ) {
+    count = 0;
+
+    while ( count < len ) {
+      res = __real_read(sockfd, &c, 1);
+      
+      if (res == 0 ) {
+        return count;
+      } else if ( res < 0 ) {
+        return 0;
+      }
+      
+      ((char *)buf)[count++] = c;
+      
+      if ( c == '\n') {
+        return count;
+      }
+    }
+    
+    return count;
+  }
+
+  return 0;
+}
+
+extern "C"
+int __wrap_bind(int sockfd, const struct sockaddr *addr, socklen_t addrlen)
+{
+  return 0;
+}
+
+extern "C"
+int __wrap_close(int sockfd)
+{
+  if ( sockfd == http_client_fd ) {
+    http_client_fd = -1;
+  }
+
+  if ( sockfd == http_listen_fd ) {
+    http_listen_fd = -1;
+  }
+
+  return __real_close(sockfd);
+}
+
+extern "C"
+ssize_t __wrap_send(int sockfd, const void *buf, size_t len, int flags)
+{
+  return __real_send(sockfd, buf, len, flags);
+}
+
+extern "C"
+int __wrap_select(int nfds, fd_set *readfds, fd_set *writefds,
+                  fd_set *exceptfds, struct timeval *timeout)
+{
+  int count = 0;
+
+  if ( readfds ) {
+    if ( http_listen_fd != -1) {
+      FD_SET(http_listen_fd, readfds);
+      count++;
+    }
+
+    if ( http_client_fd != -1) {
+      FD_SET(http_client_fd, readfds);
+      count++;
+    }
+  }
+
+  if ( writefds ) {
+    if ( http_client_fd != -1) {
+      FD_SET(http_client_fd, writefds);
+      count++;
+    }
+  }
+
+  return count;
+}
+
+extern "C"
+ssize_t __wrap_read(int fd, void *buf, size_t count)
+{
+  return __real_read(fd, buf, count);
+}
+
+extern "C"
+int __wrap_epoll_create(int size)
+{
+  return __real_epoll_create(size);
+}
+
+extern "C"
+int  __wrap_epoll_create1(int flags)
+{
+  return __real_epoll_create1(flags);
+}
+
+extern "C"
+int __wrap_epoll_ctl(int epfd, int op, int fd, struct epoll_event *event)
+{
+  return __real_epoll_ctl(epfd, op, fd, event);
+}
+
+extern "C"
+int __wrap_epoll_wait(int epfd, struct epoll_event *events,
+                      int maxevents, int timeout)
+{
+  return __real_epoll_wait(epfd, events, maxevents, timeout);
+}
+
+extern "C"
+int __wrap_accept(int sockfd, struct sockaddr *addr, socklen_t *addrlen)
+{
+  struct sockaddr_in * sin = (struct sockaddr_in *)addr;
+
+  // We shouldn't ever actually call accept
+  if ( sockfd == http_listen_fd && http_client_fd == -1) {
+    // We do want a real socket though
+    http_client_fd = socket( AF_INET, SOCK_STREAM, 0);
+
+    // Setup the appropriate false connection information
+    sin->sin_family = AF_INET;
+    sin->sin_port = htons(9999);
+    sin->sin_addr.s_addr = 0x0100007f; // "127.0.0.1"
+
+    return http_client_fd;
+  }
+
+  // Otherwise, set errno and return a failure
+  errno = 11; // NGX_EAGAIN
+
+  return -1;
+}
+
+extern "C"
+int __wrap_accept4(int sockfd, struct sockaddr *addr, socklen_t *addrlen, int flags)
+{  
+  return __real_accept4(sockfd, addr, addrlen, flags);
+}
+
+extern "C"
+int __wrap_shutdown(int socket, int how)
+{ 
+  return 0; 
+}
+
+extern "C"
+ssize_t __wrap_listen(int fd, void *buf, size_t bytes)
+{
+  // There should only be one listener set
+  http_listen_fd = fd;
+
+  return 0;
+}
+
+extern "C"
+int __wrap_setsockopt(int fd, int level, int optname, const void *optval,
+                      socklen_t optlen)
+{
+  return 0;
+}
+
+extern "C"
+int __wrap_getsockopt(int sockfd, int level, int optname,
+                      void *optval, socklen_t *optlen)
+{
+  int *n = (int*)optval;
+
+  // The getsockopt wants to confirm that the socket is a sock_stream
+  // SOL_SOCKET, SO_TYPE
+
+  *n = SOCK_STREAM;
+
+  return 0;
+}
+
+extern "C"
+int __wrap_chmod(const char *pathname, mode_t mode)
+{
+  return 0;
+}
+
+extern "C"
+int __wrap_chown(const char *pathname, uid_t owner, gid_t group)
+{
+  return 0;
+}
+
+struct passwd pwd;
+struct group grp;
+
+extern "C"
+struct passwd *__wrap_getpwnam(const char *name)
+{
+  pwd.pw_uid = 1;
+  return &pwd;
+}
+
+extern "C"
+struct group *__wrap_getgrnam(const char *name)
+{
+  grp.gr_gid = 1;
+  return &grp;
 }
