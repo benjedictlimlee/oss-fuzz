@@ -20,7 +20,7 @@ cp -r $SRC/fuzz src/
 cp $SRC/make_fuzzers auto/make_fuzzers
 
 cd src/fuzz
-#rm -rf genfiles && mkdir genfiles && $SRC/LPM/external.protobuf/bin/protoc http_request_proto.proto --cpp_out=genfiles
+rm -rf genfiles && mkdir genfiles && $SRC/LPM/external.protobuf/bin/protoc http_request_proto.proto --cpp_out=genfiles
 cd ../..
 
 auto/configure \
@@ -30,13 +30,12 @@ auto/configure \
     --with-mail
 make -f objs/Makefile fuzzers
 
-#cp objs/*_harness objs/*_fuzzer $OUT/
-cp objs/*_harness $OUT/
+cp objs/*_harness objs/*_fuzzer $OUT/
 cp $SRC/fuzz/*.dict $OUT/
 mkdir ${OUT}/html
 cp ${SRC}/nginx/docs/html/index.html ${OUT}/html/index.html
 
-for harness in "mail_request_harness" "smtp_harness"; do
+for harness in "http_request_fuzzer" "mail_request_harness" "smtp_harness"; do
     echo "[asan]" > ${OUT}/$harness.options
     echo "detect_leaks=0" >> ${OUT}/$harness.options
 done

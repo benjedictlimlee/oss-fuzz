@@ -16,7 +16,7 @@ ngx_objs=`echo $ngx_all_objs $ngx_modules_obj \
 
 cat << END                                                    >> $NGX_MAKEFILE
 
-fuzzers: objs/smtp_harness objs/mail_request_harness
+fuzzers: objs/smtp_harness objs/mail_request_harness objs/http_request_fuzzer
 
 objs/smtp_harness: $ngx_deps_fuzz
 	\$(CXX) \$(CXXFLAGS) -DNDEBUG src/fuzz/smtp_harness.cc \
@@ -31,6 +31,20 @@ objs/mail_request_harness: $ngx_deps_fuzz
 	 -o objs/mail_request_harness \
 	 \$(CORE_INCS) \$(HTTP_INCS) \
 	 -I \$(SRC)/ -I src/mail \
+	 $ngx_binexit$ngx_long_cont$ngx_objs \
+	 \$(LIB_FUZZING_ENGINE) $ngx_libs$ngx_link$ngx_main_link -lcrypt
+
+objs/http_request_fuzzer: $ngx_deps_fuzz
+	 \$(CXX) \$(CXXFLAGS) -DNDEBUG src/fuzz/http_request_fuzzer.cc \
+	 src/fuzz/genfiles/http_request_proto.pb.cc \
+	 -o objs/http_request_fuzzer \
+	 \$(CORE_INCS) \$(HTTP_INCS) \
+	 -I src/fuzz/genfiles/ -I \$(SRC)/ \
+	 -I \$(SRC)/libprotobuf-mutator/ \
+	 -I \$(SRC)/LPM/external.protobuf/include \
+	 \$(SRC)/LPM/src/libfuzzer/libprotobuf-mutator-libfuzzer.a \
+	 \$(SRC)/LPM/src/libprotobuf-mutator.a \
+	 -Wl,--start-group \$(SRC)/LPM/external.protobuf/lib/lib*.a -Wl,--end-group \
 	 $ngx_binexit$ngx_long_cont$ngx_objs \
 	 \$(LIB_FUZZING_ENGINE) $ngx_libs$ngx_link$ngx_main_link -lcrypt
 $ngx_long_end
