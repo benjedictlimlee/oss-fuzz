@@ -17,7 +17,7 @@
 FROM gcr.io/oss-fuzz-base/base-builder
 RUN apt-get update && \
     apt-get install -y make autoconf automake groff libtool pkg-config cmake nasm autopoint
-RUN git clone --depth 1 https://github.com/imagemagick/imagemagick
+RUN git clone --depth 1 https://github.com/imagemagick/imagemagick --branch 7.1.2-0
 RUN git clone --depth 1 https://gitlab.com/libtiff/libtiff
 RUN git clone --depth 1 https://github.com/strukturag/libde265
 RUN git clone --depth 1 https://github.com/strukturag/libheif
@@ -37,3 +37,5 @@ RUN git clone https://www.cl.cam.ac.uk/~mgk25/git/jbigkit # does not support sha
 ADD https://lcamtuf.coredump.cx/afl/demo/afl_testcases.tgz afl_testcases.tgz
 WORKDIR imagemagick
 COPY build.sh run_tests.sh replay_build.sh $SRC/
+COPY build_fuzzer_mng1.sh build_fuzzer_miff1.sh encoder_fuzzer2.cc utils.cc $SRC/imagemagick/oss-fuzz
+COPY imageoss_build.sh $SRC/imagemagick/oss-fuzz/build.sh
